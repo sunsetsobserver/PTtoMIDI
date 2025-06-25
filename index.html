@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>PT to MIDI</title>
+    <link rel="stylesheet" type="text/css" href="style.css">
+  </head>
+  <body>
+    <div class="center-container text-center">
+      <div id="filecontrol">
+        <button type="button" id="download_midi">> Download MIDI</button>
+      </div>
+  
+      <section id="section1">
+        <midi-player src="" sound-font visualizer="#section1 midi-visualizer"></midi-player>
+        <midi-visualizer type="piano-roll" src=""></midi-visualizer>
+        <midi-visualizer type="staff" src=""></midi-visualizer>
+      </section>
+    </div>
+    <script src="jzz.js"></script>
+    <script src="jzz-midi-smf.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vexflow/build/cjs/vexflow.js"></script>
+    <script src="https://cdn.jsdelivr.net/combine/npm/tone@14.7.58,npm/@magenta/music@1.23.1/es6/core.js,npm/focus-visible@5,npm/html-midi-player@1.4.0"></script>
+    <script type="module" src="index.js"></script>
+  </body>
+</html>

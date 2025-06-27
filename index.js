@@ -1,3 +1,5 @@
+let midiData = [];
+
 function convertPTToMIDIData(ptResponse) {
   const scalarMap = {
     pitch:    'midinote',
@@ -264,78 +266,27 @@ function loadGeneratedMidiFile(midiFileUri) {
   
 
 // Fetch PT API response
-const ptResponse = [
-  {
-    "data": [
-      0,
-      0,
-      0,
-      1,
-      1,
-      1,
-      2,
-      2,
-      2,
-      3,
-      3,
-      3,
-      4,
-      4,
-      4,
-      5,
-      5,
-      5,
-      6,
-      6,
-      6,
-      7,
-      7,
-      7,
-      8,
-      8,
-      8,
-      9,
-      9,
-      9
-    ],
-    "feature_path": "/AlternatingMajorMinor/CollectThreeValuesPerTime/time"
-  },
-  {
-    "data": [
-      60,
-      64,
-      67,
-      60,
-      63,
-      67,
-      60,
-      64,
-      67,
-      60,
-      63,
-      67,
-      60,
-      64,
-      67,
-      60,
-      63,
-      67,
-      60,
-      64,
-      67,
-      60,
-      63,
-      67,
-      60,
-      64,
-      67,
-      60,
-      63,
-      67
-    ],
-    "feature_path": "/AlternatingMajorMinor/MajorMinorThreeValuesEach/pitch"
+const ptInput = document.getElementById('pt-input');
+
+function updateFromTextarea() {
+  try {
+    const parsed = JSON.parse(ptInput.value);
+    midiData = convertPTToMIDIData(parsed);
+    const uri = getMIDIuri(midiData);
+    loadGeneratedMidiFile(uri);
+  } catch (err) {
+    console.warn('PT JSON invalid:', err);
   }
-];
+}
+
+// re-generate on every edit:
+ptInput.addEventListener('input', updateFromTextarea);
+
+// initial render:
+window.addEventListener('DOMContentLoaded', updateFromTextarea);
+
+// make download use the latest midiData
+document.getElementById("download_midi").addEventListener("click", () => downloadMIDI(midiData));
 
 /* const ptResponse = [
     { feature_path: "siema/test0/pitch",    data: [60, 61, 62, 63] },
@@ -352,26 +303,3 @@ const ptResponse = [
     { feature_path: "/textureA/time",  data: [ 0,  1,  2]    },
     { feature_path: "/textureA/duration", data: [1,1,1]     }
 ]; */
-  
-// 2. Convert
-const midiData = convertPTToMIDIData(ptResponse);
-
-console.log(midiData);
-  
-// 3. Hand off to your existing MIDI generator
-
-loadGeneratedMidiFile(getMIDIuri(midiData));
-
-// Download MIDI file:
-document.getElementById("download_midi").addEventListener("click", async () =>{
-
-	downloadMIDI(midiData);
-})
-
-document.addEventListener('keydown', function(event) {
-	// Check if the pressed key is the 'e' key (you can change this to any key you want)
-	if (event.key === 'd') {
-	  // Call the function to export the canvas as a PNG image
-      downloadMIDI(midiData);
-	}
-});

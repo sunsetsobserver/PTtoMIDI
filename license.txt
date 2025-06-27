@@ -1,5 +1,4 @@
 --------------------------------------------------------------------------------
-Canons
 MIT License
 Copyright (c) 2024 Adam Łukawski (sunsets observer)
 

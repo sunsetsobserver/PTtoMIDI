@@ -1,197 +1,222 @@
 let midiData = [];
 
 function convertPTToMIDIData(ptResponse) {
-  // 1. group data by "root/dimension"
-  const buckets = {};
+
+  const groups = {};
   ptResponse.forEach(({ feature_path, data }) => {
     const parts = feature_path.split('/').filter(Boolean);
     if (parts.length < 2) return;
-    const root = parts[0];
-    const dim  = parts[1];
-    const scalar = parts[parts.length - 1];
-    const key = `${root}/${dim}`;
-    buckets[key] = buckets[key] || {};
-    buckets[key][scalar] = data;
+    const prefix = parts.slice(0, -1).join('/');
+    const scalar = parts.at(-1);
+    (groups[prefix] ||= {})[scalar] = data;
   });
 
-  const result = [];
-  let trackIndex = 0;
+  const events = [];
+  let   track  = 0;
 
-  // 2. for each bucket, decide if it’s a metre or a scale
-  Object.values(buckets).forEach(map => {
-    // — time-signature if we have numerator+denominator
-    if (Array.isArray(map.numerator) && Array.isArray(map.denominator) && Array.isArray(map.time)) {
-      for (let i = 0; i < map.time.length; i++) {
-        result.push({
-          type:        'timeSig',
-          time:        map.time[i],
-          numerator:   map.numerator[i],
-          denominator: map.denominator[i]
-        });
-      }
+  // Helper: deduplicate successive identical metre changes
+  function pushTimeSig(t, num, den) {
+    const last = events.at(-1);
+    if (!(last && last.type === 'timeSig' &&
+          last.time === t && last.numerator === num && last.denominator === den)) {
+      events.push({ type:'timeSig', time:t, numerator:num, denominator:den });
     }
+  }
 
-    // — notes if we have pitch+time
-    if (Array.isArray(map.pitch) && Array.isArray(map.time)) {
-      for (let i = 0; i < map.time.length; i++) {
-        result.push({
-          type:       'note',
-          trackIndex,
-          channel:    trackIndex % 16,
-          midinote:   map.pitch[i],
-          time:       map.time[i],
-          duration:   (map.duration?.[i]  ?? 1),
-          velocity:   (map.velocity?.[i]  ?? 80)
-        });
-      }
-      trackIndex++;
+  // We also need, per *root*, a list of candidate time arrays
+  const rootTimePools = {};  // root → [ { time, dur?, vel? }, … ]
+
+  // First pass: metre buckets & time-array pools
+  Object.entries(groups).forEach(([prefix, g]) => {
+    const root = prefix.split('/')[0];
+
+    // pool non-metre timelines for later note pairing
+    if (Array.isArray(g.time) && !g.numerator)
+      (rootTimePools[root] ||= []).push(g);
+
+    // metre bucket?
+    if (g.numerator && g.denominator && g.time) {
+      g.time.forEach((t, i) =>
+        pushTimeSig(t, g.numerator[i], g.denominator[i]));
     }
   });
 
-  return result;
+  // Second pass: note buckets
+  Object.entries(groups).forEach(([prefix, g]) => {
+    if (!g.pitch) return;                       // not a note bucket
+    const root = prefix.split('/')[0];
+
+    // choose a matching time array
+    let tArr = g.time;
+    let dArr = g.duration;
+    let vArr = g.velocity;
+
+    if (!tArr) {
+      const match = (rootTimePools[root] || [])
+        .find(p => p.time.length === g.pitch.length);
+      if (!match) {
+        console.warn(`No matching time[] for pitch bucket ${prefix}; skipped.`);
+        return;
+      }
+      tArr = match.time;
+      dArr = dArr || match.duration;
+      vArr = vArr || match.velocity;
+    }
+
+    // emit notes
+    tArr.forEach((t, i) => events.push({
+      type:       'note',
+      trackIndex: track,
+      channel:    track % 16,
+      midinote:   g.pitch[i],
+      time:       t,
+      duration:   dArr?.[i] ?? 1,
+      velocity:   vArr?.[i] ?? 80
+    }));
+    track++;
+  });
+
+  /* ── 3. Guarantee defaults at t = 0 ──────────────────────── */
+  if (!events.some(e => e.type === 'tempo'))
+    events.push({ type:'tempo',  time:0, bpm:120 });
+
+  if (!events.some(e => e.type === 'timeSig'))
+    events.push({ type:'timeSig', time:0, numerator:4, denominator:4 });
+
+  /* ── 4. Sort (time ↑, then tempo → timeSig → note) ───────── */
+  const order = { tempo:0, timeSig:1, note:2 };
+  events.sort((a, b) => a.time - b.time || order[a.type] - order[b.type]);
+
+  return events;
 }
-
-
-
 
 function downloadMIDI(data) {
-    // Type 1 SMF — multi-track
-    let smf = JZZ.MIDI.SMF(1, 960);
-    
-    // Create conductor track (track 0)
-    let conductor = new JZZ.MIDI.SMF.MTrk();
-    smf.push(conductor);
-    conductor.add(0, JZZ.MIDI.smfSeqName('PTtoMIDI'));
+  const PPQ = 960;
+  // 1) Create a new Type-1 SMF
+  const smf       = JZZ.MIDI.SMF(1, PPQ);
+  // --- conductor track (track 0) ---
+  const conductor = new JZZ.MIDI.SMF.MTrk();
+  smf.push(conductor);
+  conductor.add(0, JZZ.MIDI.smfSeqName('PTtoMIDI'));
 
-    // Collect all tracks by trackIndex
-    const trackMap = new Map();
+  // 2) Build a map of note-tracks
+  const trackMap  = new Map(); // trackIndex → MTrk
+  let   maxTick   = 0;
 
-    for (let note of data) {
-        if (note.type === "note") {
-            if (!trackMap.has(note.trackIndex)) {
-                const newTrk = new JZZ.MIDI.SMF.MTrk();
-                smf.push(newTrk);
-                trackMap.set(note.trackIndex, newTrk);
-                newTrk.add(0, JZZ.MIDI.smfInstrName(`Instrument ${note.trackIndex + 1}`));
-                if (note.channel !== undefined && note.program !== undefined) {
-                    newTrk.add(0, JZZ.MIDI.program(note.channel, note.program));
-                }
-            }
-        }
+  // First, create one MTrk per trackIndex you actually use
+  data.forEach(evt => {
+    if (evt.type === 'note' && !trackMap.has(evt.trackIndex)) {
+      const trk = new JZZ.MIDI.SMF.MTrk();
+      smf.push(trk);
+      // (optional) name the track
+      trk.add(0, JZZ.MIDI.smfInstrName(`Instrument ${evt.trackIndex+1}`));
+      trackMap.set(evt.trackIndex, trk);
     }
+  });
 
-    // Write events
-    for (let note of data) {
-        let tick = Math.round(960 * note.time / 4);
+  // 3) Dump all events in absolute‐time order
+  //    (tempo/timeSig go to conductor; notes to their tracks)
+  //    We assume you've already sorted `data` by evt.time ascending.
+  data.forEach(evt => {
+    const tick = Math.round(PPQ * evt.time / 4);
+    maxTick = Math.max(maxTick, tick);
 
-        if (note.type === "tempo") {
-            conductor.add(tick, JZZ.MIDI.smfBPM(note.bpm));
-        }
-        else if (note.type === "timeSig") {
-            conductor.add(tick, JZZ.MIDI.smfTimeSignature(note.numerator, note.denominator));
-        }
-        else if (note.type === "keySig") {
-            conductor.add(tick, JZZ.MIDI.smfKeySignature(note.key));
-        }
-        else if (note.type === "text") {
-            conductor.add(tick, JZZ.MIDI.smfText(note.text));
-        }
-        else if (note.type === "note") {
-            const trk = trackMap.get(note.trackIndex);
-            const velocity = note.velocity ?? 80;
-            const channel = note.channel ?? 0;
-            const duration = Math.round(960 * note.duration / 4);
-            trk.add(tick, JZZ.MIDI.noteOn(channel, note.midinote, velocity));
-            trk.add(tick + duration, JZZ.MIDI.noteOff(channel, note.midinote));
-        }
+    if (evt.type === 'tempo') {
+      conductor.add(tick, JZZ.MIDI.smfBPM(evt.bpm));
     }
-
-    // Add EndOfTrack to all tracks
-    for (let trk of smf) {
-        trk.add(0, JZZ.MIDI.smfEndOfTrack());
+    else if (evt.type === 'timeSig') {
+      conductor.add(tick, JZZ.MIDI.smfTimeSignature(evt.numerator, evt.denominator));
     }
+    else if (evt.type === 'keySig') {
+      conductor.add(tick, JZZ.MIDI.smfKeySignature(evt.key));
+    }
+    else if (evt.type === 'text') {
+      conductor.add(tick, JZZ.MIDI.smfText(evt.text));
+    }
+    else if (evt.type === 'note') {
+      const trk    = trackMap.get(evt.trackIndex);
+      const absOn  = tick;
+      // ← FIXED: calculate absolute Off‐time as time+duration
+      const absOff = Math.round(PPQ * (evt.time + evt.duration) / 4);
+      maxTick = Math.max(maxTick, absOff);
 
-    // Export
-    const str = smf.dump();
-    const b64 = JZZ.lib.toBase64(str);
-    const uri = 'data:audio/midi;base64,' + b64;
-    const link = document.createElement('a');
-    link.href = uri;
-    link.download = 'PTtoMIDI.mid';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+      // noteOn at absOn
+      trk.add(absOn,  JZZ.MIDI.noteOn (evt.channel, evt.midinote, evt.velocity));
+      // noteOff at absOff (must include velocity = 0)
+      trk.add(absOff, JZZ.MIDI.noteOff(evt.channel, evt.midinote, 0));
+    }
+  });
+
+  // 4) Add EndOfTrack at maxTick+1 on every track
+  conductor.add(maxTick + 1, JZZ.MIDI.smfEndOfTrack());
+  for (let trk of smf) {
+    if (trk !== conductor) {
+      trk.add(maxTick + 1, JZZ.MIDI.smfEndOfTrack());
+    }
+  }
+
+  // 5) Export as a downloadable .mid
+  const b64  = JZZ.lib.toBase64(smf.dump());
+  const uri  = 'data:audio/midi;base64,' + b64;
+  const link = document.createElement('a');
+  link.href     = uri;
+  link.download = 'PTtoMIDI.mid';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
 }
 
+/** Build a data-URI for the same MIDI, for the browser visualizer. */
+function getMIDIuri(data) {
+  const PPQ = 960;
+  const smf = JZZ.MIDI.SMF(1, PPQ);
+  const conductor = new JZZ.MIDI.SMF.MTrk();
+  smf.push(conductor);
+  conductor.add(0, JZZ.MIDI.smfSeqName('PTtoMIDI'));
 
+  const trackMap = new Map();
+  let maxTick = 0;
 
-
-function getMIDIuri(data){ // time / midinote / duration / velocity 
-    // Type 1 SMF — multi-track
-    let smf = JZZ.MIDI.SMF(1, 960);
-    
-    // Create conductor track (track 0)
-    let conductor = new JZZ.MIDI.SMF.MTrk();
-    smf.push(conductor);
-    conductor.add(0, JZZ.MIDI.smfSeqName('PTtoMIDI'));
-
-    // Collect all tracks by trackIndex
-    const trackMap = new Map();
-
-    for (let note of data) {
-        if (note.type === "note") {
-            if (!trackMap.has(note.trackIndex)) {
-                const newTrk = new JZZ.MIDI.SMF.MTrk();
-                smf.push(newTrk);
-                trackMap.set(note.trackIndex, newTrk);
-                newTrk.add(0, JZZ.MIDI.smfInstrName(`Instrument ${note.trackIndex + 1}`));
-                if (note.channel !== undefined && note.program !== undefined) {
-                    newTrk.add(0, JZZ.MIDI.program(note.channel, note.program));
-                }
-            }
-        }
+  data.forEach(evt => {
+    if (evt.type === 'note' && !trackMap.has(evt.trackIndex)) {
+      const trk = new JZZ.MIDI.SMF.MTrk();
+      smf.push(trk);
+      trk.add(0, JZZ.MIDI.smfInstrName(`Instrument ${evt.trackIndex+1}`));
+      trackMap.set(evt.trackIndex, trk);
     }
+  });
 
-    // Write events
-    for (let note of data) {
-        let tick = Math.round(960 * note.time / 4);
+  data.forEach(evt => {
+    const tick = Math.round(PPQ * evt.time / 4);
+    maxTick = Math.max(maxTick, tick);
 
-        if (note.type === "tempo") {
-            conductor.add(tick, JZZ.MIDI.smfBPM(note.bpm));
-        }
-        else if (note.type === "timeSig") {
-            conductor.add(tick, JZZ.MIDI.smfTimeSignature(note.numerator, note.denominator));
-        }
-        else if (note.type === "keySig") {
-            conductor.add(tick, JZZ.MIDI.smfKeySignature(note.key));
-        }
-        else if (note.type === "text") {
-            conductor.add(tick, JZZ.MIDI.smfText(note.text));
-        }
-        else if (note.type === "note") {
-            const trk = trackMap.get(note.trackIndex);
-            const velocity = note.velocity ?? 80;
-            const channel = note.channel ?? 0;
-            const duration = Math.round(960 * note.duration / 4);
-            trk.add(tick, JZZ.MIDI.noteOn(channel, note.midinote, velocity));
-            trk.add(tick + duration, JZZ.MIDI.noteOff(channel, note.midinote));
-        }
+    if (evt.type === 'tempo') {
+      conductor.add(tick, JZZ.MIDI.smfBPM(evt.bpm));
     }
-
-    // Add EndOfTrack to all tracks
-    for (let trk of smf) {
-        trk.add(0, JZZ.MIDI.smfEndOfTrack());
+    else if (evt.type === 'timeSig') {
+      conductor.add(tick, JZZ.MIDI.smfTimeSignature(evt.numerator, evt.denominator));
     }
+    else if (evt.type === 'note') {
+      const trk    = trackMap.get(evt.trackIndex);
+      const absOn  = tick;
+      const absOff = Math.round(PPQ * (evt.time + evt.duration) / 4);
+      maxTick = Math.max(maxTick, absOff);
 
-    // Export
-    const str = smf.dump();
-    const b64 = JZZ.lib.toBase64(str);
-    const uri = 'data:audio/midi;base64,' + b64;
-    return uri;
+      trk.add(absOn,  JZZ.MIDI.noteOn (evt.channel, evt.midinote, evt.velocity));
+      trk.add(absOff, JZZ.MIDI.noteOff(evt.channel, evt.midinote, 0));
+    }
+  });
+
+  conductor.add(maxTick + 1, JZZ.MIDI.smfEndOfTrack());
+  for (let trk of smf) {
+    if (trk !== conductor) {
+      trk.add(maxTick + 1, JZZ.MIDI.smfEndOfTrack());
+    }
+  }
+
+  return 'data:audio/midi;base64,' + JZZ.lib.toBase64(smf.dump());
 }
 
-
-// Function to load and display the generated MIDI file
 function loadGeneratedMidiFile(midiFileUri) {
 	// Convert the data URI to a Blob
 	const byteCharacters = atob(midiFileUri.split(',')[1]);
@@ -212,62 +237,6 @@ function loadGeneratedMidiFile(midiFileUri) {
 	});
 }
 
-
-/* function convertSoundsToMidiNotes(array) {
-
-	var allPitchesInRange = [
-		"G3", "G#3", "Ab3", "A3", "A#3", "Bb3", "B3", 
-		"C4", "C#4", "Db4", "D4", "D#4", "Eb4", "E4", "F4", "F#4", "Gb4", "G4", "G#4", "Ab4", "A4", "A#4", "Bb4", "B4",
-		"C5", "C#5", "Db5", "D5", "D#5", "Eb5", "E5", "F5", "F#5", "Gb5", "G5", "G#5", "Ab5", "A5", "A#5", "Bb5", "B5",
-		"C6", "C#6", "Db6", "D6", "D#6", "Eb6", "E6",
-		"F6", "F#6", "Gb6", "G6", "G#6", "Ab6", "A6", "A#6", "Bb6", "B6", "C7"
-	];
-	
-	var midiNotes = [
-		55, 56, 56, 57, 58, 58, 59, 
-		60, 61, 61, 62, 63, 63, 64, 65, 66, 66, 67, 68, 68, 69, 70, 70, 71,
-		72, 73, 73, 74, 75, 75, 76, 77, 78, 78, 79, 80, 80, 81, 82, 82, 83,
-		84, 85, 85, 86, 87, 87, 88,
-		89, 90, 90, 91, 92, 92, 93, 94, 94, 95, 96
-	];	
-
-    // Create a mapping between pitches and MIDI notes
-    var pitchToMidiNote = {};
-    allPitchesInRange.forEach((pitch, index) => {
-        pitchToMidiNote[pitch] = midiNotes[index];
-    });
-
-    // Use map to convert frequencies to MIDI notes and replace the frequency with midiNote in each object
-    return array.map(obj => ({
-        ...obj,
-        midinote: pitchToMidiNote[obj.frequency], // Add the MIDI note
-        // Remove the frequency property by destructuring it out and capturing the rest of the properties with 'rest'
-    })).map(({ frequency, ...rest }) => rest);
-} */
-
-
-/* let data = [
-    { type: "tempo", time: 0, bpm: 120 },
-    { type: "timeSig", time: 0, numerator: 4, denominator: 4 },
-    { time: 0, midinote: 60, duration: 1, velocity: 90 },
-    { time: 1, midinote: 62, duration: 1 },
-    { time: 2, midinote: 64, duration: 1 },
-    { time: 3, midinote: 68, duration: 1 },
-    { type: "timeSig", time: 4, numerator: 3, denominator: 4 },
-    { time: 4, midinote: 64, duration: 1 },
-    { time: 5, midinote: 65, duration: 1 },
-    { time: 6, midinote: 67, duration: 1 }
-]; */
-
-/* let data = [
-    { type: "tempo", time: 0, bpm: 120 },
-    { type: "timeSig", time: 0, numerator: 4, denominator: 4 },
-    { type: "note", trackIndex: 0, channel: 0, time: 0, midinote: 60, duration: 8 },
-    { type: "note", trackIndex: 1, channel: 1, time: 1, midinote: 65, duration: 7 },
-    { type: "note", trackIndex: 2, channel: 2, time: 2, midinote: 67, duration: 6}
-]; */
-  
-
 // Fetch PT API response
 const ptInput = document.getElementById('pt-input');
 
@@ -275,6 +244,7 @@ function updateFromTextarea() {
   try {
     const parsed = JSON.parse(ptInput.value);
     midiData = convertPTToMIDIData(parsed);
+    console.log(midiData);
     const uri = getMIDIuri(midiData);
     loadGeneratedMidiFile(uri);
   } catch (err) {
@@ -290,19 +260,3 @@ window.addEventListener('DOMContentLoaded', updateFromTextarea);
 
 // make download use the latest midiData
 document.getElementById("download_midi").addEventListener("click", () => downloadMIDI(midiData));
-
-/* const ptResponse = [
-    { feature_path: "siema/test0/pitch",    data: [60, 61, 62, 63] },
-    { feature_path: "siema/test0/time",     data: [ 0,  0,  0,  0] },
-    { feature_path: "siema/test0/duration", data: [ 4,  4,  4,  4] },
-    { feature_path: "siema/test0/velocity", data: [80, 85, 90, 95] },
-
-    { feature_path: "siema/test1/pitch",    data: [72, 73, 74, 75] },
-    { feature_path: "siema/test1/time",     data: [ 4,  4,  4,  4] },
-    { feature_path: "siema/test1/duration", data: [ 4,  4,  4,  4] },
-    { feature_path: "siema/test1/velocity", data: [80, 85, 90, 95] },
-
-    { feature_path: "/textureA/pitch", data: [72, 73, 74]    },
-    { feature_path: "/textureA/time",  data: [ 0,  1,  2]    },
-    { feature_path: "/textureA/duration", data: [1,1,1]     }
-]; */

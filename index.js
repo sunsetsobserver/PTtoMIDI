@@ -1,54 +1,57 @@
 let midiData = [];
 
 function convertPTToMIDIData(ptResponse) {
-  const scalarMap = {
-    pitch:    'midinote',
-    time:     'time',
-    duration: 'duration',
-    velocity: 'velocity'
-  };
-
-  // root → [ { time?, midinote?, … }, … ]
-  const notesByRoot = new Map();
-
+  // 1. group data by "root/dimension"
+  const buckets = {};
   ptResponse.forEach(({ feature_path, data }) => {
-    const parts  = feature_path.split('/').filter(Boolean);
+    const parts = feature_path.split('/').filter(Boolean);
     if (parts.length < 2) return;
-    const root   = parts[0];
+    const root = parts[0];
+    const dim  = parts[1];
     const scalar = parts[parts.length - 1];
-    const field  = scalarMap[scalar];
-    if (!field) return;
-
-    if (!notesByRoot.has(root)) notesByRoot.set(root, []);
-    const arr = notesByRoot.get(root);
-
-    data.forEach((val, i) => {
-      if (!arr[i]) arr[i] = {};
-      arr[i][field] = val;
-    });
+    const key = `${root}/${dim}`;
+    buckets[key] = buckets[key] || {};
+    buckets[key][scalar] = data;
   });
 
-  // flatten into real notes
   const result = [];
   let trackIndex = 0;
-  for (let [root, arr] of notesByRoot) {
-    arr.forEach(entry => {
-      if (entry.midinote != null && entry.time != null) {
+
+  // 2. for each bucket, decide if it’s a metre or a scale
+  Object.values(buckets).forEach(map => {
+    // — time-signature if we have numerator+denominator
+    if (Array.isArray(map.numerator) && Array.isArray(map.denominator) && Array.isArray(map.time)) {
+      for (let i = 0; i < map.time.length; i++) {
         result.push({
-          type:      'note',
-          trackIndex,
-          channel:   trackIndex % 16,
-          midinote:  entry.midinote,
-          time:      entry.time,
-          duration:  entry.duration != null ? entry.duration : 1,
-          velocity:  entry.velocity != null ? entry.velocity : 80
+          type:        'timeSig',
+          time:        map.time[i],
+          numerator:   map.numerator[i],
+          denominator: map.denominator[i]
         });
       }
-    });
-    trackIndex++;
-  }
+    }
+
+    // — notes if we have pitch+time
+    if (Array.isArray(map.pitch) && Array.isArray(map.time)) {
+      for (let i = 0; i < map.time.length; i++) {
+        result.push({
+          type:       'note',
+          trackIndex,
+          channel:    trackIndex % 16,
+          midinote:   map.pitch[i],
+          time:       map.time[i],
+          duration:   (map.duration?.[i]  ?? 1),
+          velocity:   (map.velocity?.[i]  ?? 80)
+        });
+      }
+      trackIndex++;
+    }
+  });
+
   return result;
 }
+
+
 
 
 function downloadMIDI(data) {
